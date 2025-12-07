@@ -56,7 +56,7 @@ exit_with_err() {
     exit 1
 }
 
-# 1. 检测运行环境 (Requirement 1)
+# 1. 检测运行环境
 detect_system() {
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         SYSTEM_TYPE="systemd"
@@ -248,13 +248,14 @@ generate_config() {
     OTHER_CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$OTHER_MODE")
     USED_PORT=""
     if [ -f "$OTHER_CONFIG_FILE" ]; then
-        USED_PORT=$(jq -r '.listen' "$OTHER_CONFIG_FILE" | cut -d ':' -f 2)
+        # 尝试提取主端口，防止因为有端口跳跃字符串导致判断错误
+        USED_PORT=$(jq -r '.listen' "$OTHER_CONFIG_FILE" | sed 's/^://' | cut -d ',' -f 1)
     fi
     
-    # 端口 (必须输入)
+    # 1. 端口 (必须输入)
     HY2_PORT=""
     while true; do
-        read -p "请输入 hy2 监听端口 (必须输入): " HY2_PORT
+        read -p "请输入 hy2 主监听端口 (必须输入，如 443): " HY2_PORT
         if [ -z "$HY2_PORT" ]; then
             err "端口不能为空。"
         elif [ "$HY2_PORT" = "$USED_PORT" ]; then
@@ -263,8 +264,28 @@ generate_config() {
             break
         fi
     done
+
+    # 2. 端口跳跃设置 (Port Hopping)
+    LISTEN_STR=":${HY2_PORT}"
+    read -p "是否开启端口跳跃 (Port Hopping)? (y/n) [n]: " ENABLE_HOPPING
+    [ -z "$ENABLE_HOPPING" ] && ENABLE_HOPPING="n"
     
-    # 伪装域名 (可回车默认)
+    if [ "$ENABLE_HOPPING" = "y" ] || [ "$ENABLE_HOPPING" = "Y" ]; then
+        echo "请输入端口跳跃范围 (例如 起始 20000, 结束 50000)"
+        read -p "  > 起始端口: " HOP_START
+        read -p "  > 结束端口: " HOP_END
+        
+        if [ -z "$HOP_START" ] || [ -z "$HOP_END" ]; then
+            err "起始或结束端口不能为空，已取消端口跳跃。"
+        else
+            # 格式化为 :PORT,START-END
+            LISTEN_STR=":${HY2_PORT},${HOP_START}-${HOP_END}"
+            info "已启用端口跳跃，监听配置: $LISTEN_STR"
+            info "请确保防火墙已放行该端口范围 ($HOP_START - $HOP_END)！"
+        fi
+    fi
+    
+    # 3. 伪装域名 (可回车默认)
     read -p "请输入伪装域名 (回车默认 www.microsoft.com): " FAKE_DOMAIN
     [ -z "$FAKE_DOMAIN" ] && FAKE_DOMAIN="www.microsoft.com"
     
@@ -274,8 +295,9 @@ generate_config() {
     $PRINTF_CMD "%s" "$PASSWORD" > "$HY2_PASS_FILE"
 
     # 使用 jq 构建 JSON
+    # 注意：这里传递的是 LISTEN_STR (可能包含逗号和范围)
     BASE_CONFIG=$(jq -n \
-        --arg port ":${HY2_PORT}" \
+        --arg port "${LISTEN_STR}" \
         --arg cert "${CERT_PATH}" \
         --arg key "${KEY_PATH}" \
         --arg sni "${FAKE_DOMAIN}" \
@@ -434,7 +456,7 @@ stop_service() {
     return 0
 }
 
-# 查看节点链接 (保留 V9 URL 编码修复)
+# 查看节点链接 (保留 V9 URL 编码修复，并适配端口跳跃格式)
 # 参数1: $1 (mode)
 view_link() {
     MODE=$1
@@ -462,8 +484,12 @@ view_link() {
         return 1
     fi
     
-    # 从 JSON 中读取
-    PORT=$(jq -r '.listen' "$CONFIG_FILE" | cut -d ':' -f 2)
+    # 从 JSON 中读取端口
+    # 修改逻辑：支持端口跳跃格式 (例如 :443,10000-20000)
+    # 1. sed 去掉开头的冒号
+    # 2. cut -d ',' -f 1 取逗号前的部分 (主端口)
+    PORT=$(jq -r '.listen' "$CONFIG_FILE" | sed 's/^://' | cut -d ',' -f 1)
+    
     SNI=$(jq -r '.tls.sni' "$CONFIG_FILE")
     
     # 读取原始密码(无换行)并进行 URL 编码
