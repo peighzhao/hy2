@@ -1,17 +1,17 @@
 #!/usr/bin/env sh
 
 # --- 变量定义 ---
-BINARY_PATH="/usr/local/bin/hysteria"
-CONFIG_DIR="/etc/hy2"
-# 共享证书
+# Sing-box 安装路径
+BINARY_PATH="/usr/local/bin/sing-box"
+CONFIG_DIR="/etc/sing-box"
+# 共享证书 (Sing-box 也需要证书)
 CERT_PATH="${CONFIG_DIR}/server.crt"
 KEY_PATH="${CONFIG_DIR}/server.key"
-# (V11) 模板化，用于共存
+
+# 配置文件模板 (区分 no-obfs 和 obfs)
 CONFIG_TPL="${CONFIG_DIR}/config-%s.json"
-PASS_TPL="${CONFIG_DIR}/hy2-%s.pass"
-OBFS_PASS_TPL="${CONFIG_DIR}/obfs-%s.pass"
-PID_TPL="/var/run/hy2-%s.pid"
-SERVICE_TPL="hy2-%s"
+PID_TPL="/var/run/sb-hy2-%s.pid"
+SERVICE_TPL="sb-hy2-%s"
 
 SCRIPT_PATH=$(readlink -f "$0")
 SYSTEM_TYPE="none"
@@ -24,7 +24,6 @@ elif [ -x /bin/printf ]; then
     PRINTF_CMD="/bin/printf"
 else
     echo "[致命错误] 未找到 /usr/bin/printf 或 /bin/printf。"
-    echo "请安装 'coreutils' 包后再试。"
     exit 1
 fi
 
@@ -35,26 +34,9 @@ YELLOW=$($PRINTF_CMD '\033[0;33m')
 NC=$($PRINTF_CMD '\033[0m')
 
 # --- 辅助函数 ---
-
-# 打印错误信息
-err() {
-    $PRINTF_CMD "%s[错误] %s%s\n" "${RED}" "$1" "${NC}"
-}
-
-# 打印成功信息
-succ() {
-    $PRINTF_CMD "%s[成功] %s%s\n" "${GREEN}" "$1" "${NC}"
-}
-
-# 打印提示信息
-info() {
-    $PRINTF_CMD "%s[提示] %s%s\n" "${YELLOW}" "$1" "${NC}"
-}
-
-# 退出脚本(用于错误)
-exit_with_err() {
-    exit 1
-}
+err() { $PRINTF_CMD "%s[错误] %s%s\n" "${RED}" "$1" "${NC}"; }
+succ() { $PRINTF_CMD "%s[成功] %s%s\n" "${GREEN}" "$1" "${NC}"; }
+info() { $PRINTF_CMD "%s[提示] %s%s\n" "${YELLOW}" "$1" "${NC}"; }
 
 # 1. 检测运行环境
 detect_system() {
@@ -64,171 +46,102 @@ detect_system() {
         SYSTEM_TYPE="openrc"
     else
         SYSTEM_TYPE="direct"
-        info "未检测到 systemd 或 OpenRC。将使用 direct 进程管理模式。"
     fi
 }
 
-# 检查 root 权限
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         err "此脚本需要 root 权限运行。"
-        exit_with_err
+        exit 1
     fi
 }
 
-# 检查依赖
 check_deps() {
-    info "正在检查依赖 (curl, jq, openssl)..."
-    # 检测包管理器
-    if command -v apt >/dev/null 2>&1; then
-        PM="apt"
-    elif command -v apk >/dev/null 2>&1; then
-        PM="apk"
-    else
-        err "未找到 apt 或 apk 包管理器。请手动安装 curl, jq, openssl。"
-        return 1
-    fi
-
-    # 检查并安装依赖
-    DEPS="curl jq openssl"
+    info "正在检查依赖 (curl, jq, openssl, tar)..."
+    if command -v apt >/dev/null 2>&1; then PM="apt"; elif command -v apk >/dev/null 2>&1; then PM="apk"; else PM="yum"; fi
+    
+    DEPS="curl jq openssl tar"
     for dep in $DEPS; do
         if ! command -v $dep >/dev/null 2>&1; then
             info "正在安装 $dep..."
-            if [ "$PM" = "apt" ]; then
-                apt update >/dev/null 2>&1
-                apt install -y $dep >/dev/null 2>&1
-            elif [ "$PM" = "apk" ]; then
-                apk add --no-cache $dep >/dev/null 2>&1
-            fi
-            if ! command -v $dep >/dev/null 2>&1; then
-                err "安装 $dep 失败。请检查您的网络或手动安装。"
-                return 1
-            fi
+            if [ "$PM" = "apt" ]; then apt update >/dev/null 2>&1 && apt install -y $dep >/dev/null 2>&1
+            elif [ "$PM" = "apk" ]; then apk add --no-cache $dep >/dev/null 2>&1
+            else yum install -y $dep >/dev/null 2>&1; fi
         fi
     done
-    return 0
 }
 
-# 获取架构
 get_arch() {
     case $(uname -m) in
         "x86_64") ARCH="amd64" ;;
         "aarch64") ARCH="arm64" ;;
-        "armv7l") ARCH="arm" ;;
+        "armv7l") ARCH="armv7" ;;
         "riscv64") ARCH="riscv64" ;;
         *) err "不支持的架构: $(uname -m)"; return 1 ;;
     esac
     return 0
 }
 
-# --- 核心功能 ---
+# --- 核心逻辑 ---
 
-# 搭建节点的核心逻辑
-# 参数1: $1 (mode: "no-obfs" | "obfs")
-install_hy2_logic() {
-    MODE=$1
-    if [ "$MODE" = "obfs" ]; then
-        WITH_OBFS="true"
-        NODE_TYPE_STR="混淆"
-    else
-        WITH_OBFS="false"
-        NODE_TYPE_STR="无混淆"
-    fi
-    
-    info "开始配置 Hysteria 2 ($NODE_TYPE_STR) 节点..."
-    
-    # 获取此模式的文件路径
-    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
-    HY2_PASS_FILE=$($PRINTF_CMD "$PASS_TPL" "$MODE")
-    OBFS_PASS_FILE=""
-    [ "$WITH_OBFS" = "true" ] && OBFS_PASS_FILE=$($PRINTF_CMD "$OBFS_PASS_TPL" "$MODE")
-
-    # 1. 检查依赖
-    if ! check_deps; then return 1; fi
-    
-    # 2. 检查和安装 *唯一* 的二进制文件
+# 安装 Sing-box 二进制文件
+install_singbox() {
     if [ -f "$BINARY_PATH" ]; then
-        info "Hysteria 2 二进制文件已存在，跳过下载。"
-    else
-        if ! get_arch; then return 1; fi
-        info "正在获取最新版本号..."
-        LATEST_VERSION=$(curl -s "https://api.github.com/repos/apernet/hysteria/releases/latest" | jq -r .tag_name)
-        if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" = "null" ]; then
-            err "获取最新版本号失败 (可能是 GitHub API 限制)。"
-            return 1
-        fi
-        info "最新版本为: $LATEST_VERSION"
-        
-        DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${LATEST_VERSION}/hysteria-linux-${ARCH}"
-        
-        info "正在下载 Hysteria 2 二进制文件..."
-        if ! curl -L -o "$BINARY_PATH" "$DOWNLOAD_URL"; then
-            err "下载失败。请检查网络或 GitHub 连接。"
-            return 1
-        fi
-        chmod +x "$BINARY_PATH"
-        succ "Hysteria 2 二进制文件安装成功。"
-    fi
-    
-    # 3. 检查和生成配置 (搭建节点)
-    if [ -f "$CONFIG_FILE" ]; then
-        $PRINTF_CMD "%s[警告] 已检测到 ($NODE_TYPE_STR) 节点的现有配置。是否覆盖? (y/n) [n]: %s" "${YELLOW}" "${NC}"
-        read -p " " RECONFIG_CHOICE
-        [ -z "$RECONFIG_CHOICE" ] && RECONFIG_CHOICE="n"
-        
-        if [ "$RECONFIG_CHOICE" != "y" ]; then
-            info "操作已取消。保留现有配置。"
-            return
-        fi
-        info "正在删除旧配置..."
-        stop_service "$MODE" >/dev/null 2>&1
-        rm -f "$CONFIG_FILE" "$HY2_PASS_FILE" "$OBFS_PASS_FILE"
-    fi
-    
-    info "开始配置新 ($NODE_TYPE_STR) 节点..."
-    # 4. 管理自签证书 (共享)
-    if ! generate_self_signed_cert; then return 1; fi
-    
-    # 5. 生成配置
-    if ! generate_config "$MODE"; then return 1; fi
-    
-    # 6. 设置服务
-    if ! setup_service "$MODE"; then return 1; fi
-    
-    # 7. 启动服务
-    if ! start_service "$MODE"; then return 1; fi
-    
-    succ "Hysteria 2 ($NODE_TYPE_STR) 节点搭建并启动成功。"
-    view_link "$MODE"
-}
-
-
-# 生成自签证书 (共享)
-generate_self_signed_cert() {
-    if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
-        info "检测到现有共享证书，跳过生成。"
+        # 简单检查版本，确保是较新的版本
+        CURRENT_VER=$($BINARY_PATH version | head -n 1 | awk '{print $3}')
+        info "Sing-box 已安装，版本: $CURRENT_VER"
         return 0
     fi
+
+    if ! get_arch; then return 1; fi
+    info "正在获取 Sing-box 最新版本..."
     
-    info "正在生成共享自签证书..."
-    mkdir -p "$CONFIG_DIR"
+    # 获取 GitHub 最新 Release
+    LATEST_TAG=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name)
+    if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+        err "获取版本失败，使用默认版本 v1.12.0 (支持端口跳跃)"
+        LATEST_TAG="v1.12.0"
+    fi
+    VERSION=${LATEST_TAG#v} # 去掉 v 前缀
     
-    if ! openssl ecparam -name prime256v1 -genkey -noout -out "$KEY_PATH" >/dev/null 2>&1; then
-        err "生成私钥 (ecparam) 失败。请检查 openssl 是否工作正常。"
+    DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${LATEST_TAG}/sing-box-${VERSION}-linux-${ARCH}.tar.gz"
+    
+    info "正在下载 Sing-box ${LATEST_TAG}..."
+    rm -f /tmp/sing-box.tar.gz
+    if ! curl -L -o /tmp/sing-box.tar.gz "$DOWNLOAD_URL"; then
+        err "下载失败。"
         return 1
     fi
     
-    if ! openssl req -new -x509 -nodes -key "$KEY_PATH" -out "$CERT_PATH" -subj "/CN=proxy.com" -days 3650 >/dev/null 2>&1; then
-         err "生成证书 (req) 失败。"
-         return 1
-    fi
-    return 0
+    info "正在解压..."
+    tar -xzf /tmp/sing-box.tar.gz -C /tmp
+    # 移动二进制文件 (解压后的目录名通常是 sing-box-版本-架构)
+    mv /tmp/sing-box-${VERSION}-linux-${ARCH}/sing-box "$BINARY_PATH"
+    chmod +x "$BINARY_PATH"
+    rm -rf /tmp/sing-box*
+    
+    succ "Sing-box 安装成功。"
 }
 
-# 生成配置文件
+# 生成自签证书
+generate_cert() {
+    mkdir -p "$CONFIG_DIR"
+    if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
+        info "使用现有证书。"
+        return 0
+    fi
+    info "正在生成自签证书..."
+    openssl ecparam -name prime256v1 -genkey -noout -out "$KEY_PATH"
+    openssl req -new -x509 -nodes -key "$KEY_PATH" -out "$CERT_PATH" -subj "/CN=bing.com" -days 3650
+}
+
+# 生成 Sing-box 配置文件
 # 参数1: $1 (mode: "no-obfs" | "obfs")
 generate_config() {
     MODE=$1
+    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
+    
+    # 确定是否开启混淆
     if [ "$MODE" = "obfs" ]; then
         WITH_OBFS="true"
         OTHER_MODE="no-obfs"
@@ -236,571 +149,301 @@ generate_config() {
         WITH_OBFS="false"
         OTHER_MODE="obfs"
     fi
-    
-    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
-    HY2_PASS_FILE=$($PRINTF_CMD "$PASS_TPL" "$MODE")
-    OBFS_PASS_FILE=""
-    [ "$WITH_OBFS" = "true" ] && OBFS_PASS_FILE=$($PRINTF_CMD "$OBFS_PASS_TPL" "$MODE")
 
-    mkdir -p "$CONFIG_DIR"
-    
-    # 检查端口是否与另一个节点冲突
+    # 1. 端口配置
     OTHER_CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$OTHER_MODE")
     USED_PORT=""
     if [ -f "$OTHER_CONFIG_FILE" ]; then
-        # 尝试提取主端口，防止因为有端口跳跃字符串导致判断错误
-        USED_PORT=$(jq -r '.listen' "$OTHER_CONFIG_FILE" | sed 's/^://' | cut -d ',' -f 1)
+        # 从 Sing-box JSON 中解析 server_ports 的第一个元素
+        USED_PORT=$(jq -r '.inbounds[0].server_ports[0]' "$OTHER_CONFIG_FILE" 2>/dev/null)
     fi
-    
-    # 1. 端口 (必须输入)
-    HY2_PORT=""
+
     while true; do
-        read -p "请输入 hy2 主监听端口 (必须输入，如 443): " HY2_PORT
-        if [ -z "$HY2_PORT" ]; then
-            err "端口不能为空。"
-        elif [ "$HY2_PORT" = "$USED_PORT" ]; then
-            err "端口 $HY2_PORT 已被 ($OTHER_MODE) 节点使用，请输入不同端口。"
-        else
-            break
-        fi
+        read -p "请输入 Hysteria 2 主端口 (例如 443): " INPUT_PORT
+        PORT=$(echo "$INPUT_PORT" | tr -d ':[:space:]')
+        if [ -z "$PORT" ]; then err "端口不能为空"; continue; fi
+        if [ "$PORT" = "$USED_PORT" ]; then err "端口已被占用"; continue; fi
+        break
     done
 
-    # 2. 端口跳跃设置 (Port Hopping)
-    LISTEN_STR=":${HY2_PORT}"
-    read -p "是否开启端口跳跃 (Port Hopping)? (y/n) [n]: " ENABLE_HOPPING
-    [ -z "$ENABLE_HOPPING" ] && ENABLE_HOPPING="n"
-    
-    if [ "$ENABLE_HOPPING" = "y" ] || [ "$ENABLE_HOPPING" = "Y" ]; then
-        echo "请输入端口跳跃范围 (例如 起始 20000, 结束 50000)"
-        read -p "  > 起始端口: " HOP_START
-        read -p "  > 结束端口: " HOP_END
-        
-        if [ -z "$HOP_START" ] || [ -z "$HOP_END" ]; then
-            err "起始或结束端口不能为空，已取消端口跳跃。"
-        else
-            # 格式化为 :PORT,START-END
-            LISTEN_STR=":${HY2_PORT},${HOP_START}-${HOP_END}"
-            info "已启用端口跳跃，监听配置: $LISTEN_STR"
-            info "请确保防火墙已放行该端口范围 ($HOP_START - $HOP_END)！"
-        fi
+    # 2. 端口跳跃 (Native Port Hopping)
+    # Sing-box 的 server_ports 是一个数组 ["443", "20000-30000"]
+    HOP_RANGE=""
+    read -p "是否开启端口跳跃? (y/n) [n]: " ENABLE_HOP
+    if [ "$ENABLE_HOP" = "y" ] || [ "$ENABLE_HOP" = "Y" ]; then
+        while true; do
+            read -p "  > 起始端口: " S_PORT
+            read -p "  > 结束端口: " E_PORT
+            S_PORT=$(echo "$S_PORT" | tr -d '[:space:]')
+            E_PORT=$(echo "$E_PORT" | tr -d '[:space:]')
+            if [ -n "$S_PORT" ] && [ -n "$E_PORT" ]; then
+                HOP_RANGE="${S_PORT}-${E_PORT}"
+                info "端口跳跃范围: $HOP_RANGE"
+                break
+            else
+                err "请输入有效的起始和结束端口。"
+            fi
+        done
     fi
-    
-    # 3. 伪装域名 (可回车默认)
-    read -p "请输入伪装域名 (回车默认 www.microsoft.com): " FAKE_DOMAIN
-    [ -z "$FAKE_DOMAIN" ] && FAKE_DOMAIN="www.microsoft.com"
-    
-    # 生成密码
+
+    # 3. 域名和密码
+    read -p "请输入伪装域名 (默认 www.microsoft.com): " SNI
+    [ -z "$SNI" ] && SNI="www.microsoft.com"
     PASSWORD=$(openssl rand -base64 16)
-    # 使用 printf 存储密码，避免换行符
-    $PRINTF_CMD "%s" "$PASSWORD" > "$HY2_PASS_FILE"
 
-    # 使用 jq 构建 JSON
-    # 注意：这里传递的是 LISTEN_STR (可能包含逗号和范围)
-    BASE_CONFIG=$(jq -n \
-        --arg port "${LISTEN_STR}" \
-        --arg cert "${CERT_PATH}" \
-        --arg key "${KEY_PATH}" \
-        --arg sni "${FAKE_DOMAIN}" \
-        --arg pass "${PASSWORD}" \
-        '{listen: $port, tls: {cert: $cert, key: $key, sni: $sni}, auth: {type: "password", password: $pass}}')
-
-    # 根据参数决定是否添加混淆
-    if [ "$WITH_OBFS" = "true" ]; then
-        OBFS_PASSWORD=$(openssl rand -base64 16)
-        # 使用 printf 存储密码，避免换行符
-        $PRINTF_CMD "%s" "$OBFS_PASSWORD" > "$OBFS_PASS_FILE"
-        
-        # 修正 obfs JSON 语法
-        FINAL_CONFIG=$(echo "$BASE_CONFIG" | jq \
-            --arg obfs_pass "$OBFS_PASSWORD" \
-            '. + {obfs: {type: "salamander", salamander: {password: $obfs_pass}}}')
-        info "流量混淆已开启。"
+    # 4. 构建 JSON (Sing-box 格式)
+    # 基础 inbound 结构
+    # server_ports 逻辑: 如果有跳跃，数组就是 ["PORT", "RANGE"]，否则就是 ["PORT"]
+    if [ -n "$HOP_RANGE" ]; then
+        PORTS_JSON="[\"$PORT\", \"$HOP_RANGE\"]"
     else
-        FINAL_CONFIG="$BASE_CONFIG"
+        PORTS_JSON="[\"$PORT\"]"
     fi
-    
-    # 写入配置文件
-    echo "$FINAL_CONFIG" | jq . > "$CONFIG_FILE"
-    
-    info "配置文件生成完毕: $CONFIG_FILE"
-    $PRINTF_CMD "%s您的 hy2 密码: %s%s\n" "${GREEN}" "$PASSWORD" "${NC}"
+
+    OBFS_JSON="null"
+    OBFS_PASS=""
     if [ "$WITH_OBFS" = "true" ]; then
-        $PRINTF_CMD "%s您的混淆密码: %s%s\n" "${GREEN}" "$OBFS_PASSWORD" "${NC}"
+        OBFS_PASS=$(openssl rand -base64 16)
+        OBFS_JSON="{\"type\": \"salamander\", \"password\": \"$OBFS_PASS\"}"
+        info "混淆已开启 (Salamander)。"
     fi
-    return 0
+
+    # 使用 jq 生成完整配置
+    jq -n \
+       --argjson ports "$PORTS_JSON" \
+       --arg pass "$PASSWORD" \
+       --arg cert "$CERT_PATH" \
+       --arg key "$KEY_PATH" \
+       --arg sni "$SNI" \
+       --argjson obfs "$OBFS_JSON" \
+       '{
+         "log": {"level": "info", "timestamp": true},
+         "inbounds": [
+           {
+             "type": "hysteria2",
+             "tag": "in-hy2",
+             "server_ports": $ports,
+             "users": [{"password": $pass}],
+             "tls": {
+               "enabled": true,
+               "certificate_path": $cert,
+               "key_path": $key
+             },
+             "obfs": $obfs
+           }
+         ]
+       }' > "$CONFIG_FILE"
+
+    succ "配置文件已生成: $CONFIG_FILE"
+    $PRINTF_CMD "%s密码: %s%s\n" "${GREEN}" "$PASSWORD" "${NC}"
+    if [ -n "$OBFS_PASS" ]; then
+        $PRINTF_CMD "%s混淆密码: %s%s\n" "${GREEN}" "$OBFS_PASS" "${NC}"
+    fi
 }
 
-# 设置服务
-# 参数1: $1 (mode)
-setup_service() {
-    MODE=$1
-    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
+# 管理服务 (Systemd / OpenRC / Direct)
+manage_service() {
+    ACTION=$1 # start, stop, setup, delete
+    MODE=$2
     SERVICE_NAME=$($PRINTF_CMD "$SERVICE_TPL" "$MODE")
+    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
     PID_FILE=$($PRINTF_CMD "$PID_TPL" "$MODE")
 
-    info "正在设置 $SYSTEM_TYPE 服务: $SERVICE_NAME"
-    case $SYSTEM_TYPE in
-        "systemd")
-            cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
+    case $ACTION in
+        setup)
+            if [ "$SYSTEM_TYPE" = "systemd" ]; then
+                cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
 [Unit]
-Description=Hysteria 2 Service (${MODE})
+Description=Sing-box Hysteria2 (${MODE})
 After=network.target
 
 [Service]
-Type=simple
-# (V13) 两个服务都调用同一个二进制文件
-ExecStart=${BINARY_PATH} server -c ${CONFIG_FILE}
-WorkingDirectory=/root
-Restart=on-failure
+ExecStart=${BINARY_PATH} run -c ${CONFIG_FILE}
+Restart=always
 RestartSec=3
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
-            systemctl daemon-reload
-            systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-            ;;
-        "openrc")
-            cat > "/etc/init.d/${SERVICE_NAME}" << EOF
+                systemctl daemon-reload
+                systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+            elif [ "$SYSTEM_TYPE" = "openrc" ]; then
+                # 简易 OpenRC 脚本
+                cat > "/etc/init.d/${SERVICE_NAME}" << EOF
 #!/sbin/openrc-run
-
-name="Hysteria 2 (${MODE})"
-description="Hysteria 2 Service"
-# (V13) 两个服务都调用同一个二进制文件
+name="${SERVICE_NAME}"
 command="${BINARY_PATH}"
-command_args="server -c ${CONFIG_FILE}"
-pidfile="${PID_FILE}"
+command_args="run -c ${CONFIG_FILE}"
 command_background="yes"
-
-depend() {
-    need net
-}
+pidfile="${PID_FILE}"
 EOF
-            chmod +x "/etc/init.d/${SERVICE_NAME}"
-            rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
-            ;;
-        "direct")
-            info "Direct 模式: ${SERVICE_NAME} 无需设置服务文件。"
-            info "启动命令: nohup ${BINARY_PATH} server -c ${CONFIG_FILE} >/dev/null 2>&1 & echo \$! > ${PID_FILE}"
-            info "停止命令: kill \$(cat ${PID_FILE}) 2>/dev/null && rm -f ${PID_FILE}"
-            ;;
-    esac
-    return 0
-}
-
-# 启动服务
-# 参数1: $1 (mode)
-start_service() {
-    MODE=$1
-    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
-    SERVICE_NAME=$($PRINTF_CMD "$SERVICE_TPL" "$MODE")
-    PID_FILE=$($PRINTF_CMD "$PID_TPL" "$MODE")
-
-    info "正在启动 $SERVICE_NAME..."
-    case $SYSTEM_TYPE in
-        "systemd") systemctl restart "$SERVICE_NAME" ;;
-        "openrc") rc-service "$SERVICE_NAME" restart ;;
-        "direct")
-            stop_service "$MODE" >/dev/null 2>&1
-            nohup "$BINARY_PATH" server -c "$CONFIG_FILE" >/dev/null 2>&1 &
-            echo $! > "$PID_FILE"
-            sleep 1
-            # 使用 /proc/$PID 检查进程是否存在
-            if [ -f "$PID_FILE" ] && [ -d "/proc/$(cat "$PID_FILE")" ]; then
-                succ "$SERVICE_NAME (direct) 已启动 (PID: $(cat "$PID_FILE"))"
-            else
-                err "$SERVICE_NAME (direct) 启动失败。"
-                return 1
+                chmod +x "/etc/init.d/${SERVICE_NAME}"
+                rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
             fi
             ;;
-    esac
-    # 增加启动后状态检查
-    sleep 2
-    if ! check_service_status_internal "$MODE"; then
-        err "服务 $SERVICE_NAME 启动失败，请检查日志！"
-        view_status "$MODE" # 自动显示日志
-        return 1
-    fi
-    return 0
-}
-
-# 停止服务
-# 参数1: $1 (mode)
-stop_service() {
-    MODE=$1
-    SERVICE_NAME=$($PRINTF_CMD "$SERVICE_TPL" "$MODE")
-    PID_FILE=$($PRINTF_CMD "$PID_TPL" "$MODE")
-
-    info "正在停止 $SERVICE_NAME..."
-    case $SYSTEM_TYPE in
-        "systemd") systemctl stop "$SERVICE_NAME" ;;
-        "openrc") rc-service "$SERVICE_NAME" stop ;;
-        "direct")
-            if [ -f "$PID_FILE" ]; then
-                PID=$(cat "$PID_FILE")
-                # 使用 /proc/$PID 检查进程是否存在
-                if [ -d "/proc/$PID" ]; then
-                    kill "$PID"
-                    sleep 1
-                    info "$SERVICE_NAME (PID: $PID) 已停止。"
-                else
-                    info "PID 文件存在，但进程 $PID 未运行。"
+        start)
+            if [ "$SYSTEM_TYPE" = "systemd" ]; then
+                systemctl restart "$SERVICE_NAME"
+            elif [ "$SYSTEM_TYPE" = "openrc" ]; then
+                rc-service "$SERVICE_NAME" restart
+            else
+                # Direct
+                manage_service stop "$MODE"
+                nohup "$BINARY_PATH" run -c "$CONFIG_FILE" >/dev/null 2>&1 &
+                echo $! > "$PID_FILE"
+                succ "$SERVICE_NAME (Direct) 已启动。"
+            fi
+            ;;
+        stop)
+             if [ "$SYSTEM_TYPE" = "systemd" ]; then
+                systemctl stop "$SERVICE_NAME"
+            elif [ "$SYSTEM_TYPE" = "openrc" ]; then
+                rc-service "$SERVICE_NAME" stop
+            else
+                if [ -f "$PID_FILE" ]; then
+                    kill $(cat "$PID_FILE") 2>/dev/null
+                    rm -f "$PID_FILE"
                 fi
-                rm -f "$PID_FILE"
-            else
-                info "$SERVICE_NAME (direct) 未运行。"
             fi
             ;;
+        delete)
+             manage_service stop "$MODE"
+             if [ "$SYSTEM_TYPE" = "systemd" ]; then
+                systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
+                rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+                systemctl daemon-reload
+             elif [ "$SYSTEM_TYPE" = "openrc" ]; then
+                rc-update del "$SERVICE_NAME" default >/dev/null 2>&1
+                rm -f "/etc/init.d/${SERVICE_NAME}"
+             fi
+             rm -f "$CONFIG_FILE"
+             succ "$MODE 节点已删除。"
+             ;;
     esac
-    return 0
 }
 
-# 查看节点链接 (保留 V9 URL 编码修复，并适配端口跳跃格式)
-# 参数1: $1 (mode)
+# 安装逻辑总入口
+install_node() {
+    MODE=$1 # "no-obfs" or "obfs"
+    
+    check_deps
+    install_singbox
+    generate_cert
+    
+    # 检查旧配置
+    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
+    if [ -f "$CONFIG_FILE" ]; then
+        read -p "检测到旧配置，是否覆盖? (y/n): " OVR
+        if [ "$OVR" != "y" ]; then return; fi
+        manage_service stop "$MODE"
+    fi
+    
+    generate_config "$MODE"
+    manage_service setup "$MODE"
+    manage_service start "$MODE"
+    
+    sleep 2
+    if ! check_status_internal "$MODE"; then
+        err "服务启动失败。尝试手动运行查看报错:"
+        echo "${BINARY_PATH} run -c ${CONFIG_FILE}"
+    else
+        succ "安装并启动成功！"
+        view_link "$MODE"
+    fi
+}
+
+# 内部检查状态
+check_status_internal() {
+    MODE=$1
+    SERVICE_NAME=$($PRINTF_CMD "$SERVICE_TPL" "$MODE")
+    if [ "$SYSTEM_TYPE" = "systemd" ]; then
+        systemctl is-active --quiet "$SERVICE_NAME"
+    elif [ "$SYSTEM_TYPE" = "openrc" ]; then
+        rc-service "$SERVICE_NAME" status | grep -q "started"
+    else
+        PID_FILE=$($PRINTF_CMD "$PID_TPL" "$MODE")
+        [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null
+    fi
+}
+
+# 查看链接
 view_link() {
     MODE=$1
-    if [ "$MODE" = "obfs" ]; then
-        NODE_TYPE_STR="混淆"
-    else
-        NODE_TYPE_STR="无混淆"
-    fi
-    
     CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
-    HY2_PASS_FILE=$($PRINTF_CMD "$PASS_TPL" "$MODE")
-
-    if [ ! -f "$CONFIG_FILE" ]; then
-        err "($NODE_TYPE_STR) 节点配置文件不存在，请先搭建。"
-        return 1
-    fi
+    if [ ! -f "$CONFIG_FILE" ]; then err "配置文件不存在"; return; fi
     
-    # 尝试多种方式获取 IP
-    SERVER_IP=$(curl -s http://checkip.amazonaws.com)
-    if [ -z "$SERVER_IP" ]; then
-        SERVER_IP=$(curl -s https://ip.sb)
-    fi
-    if [ -z "$SERVER_IP" ]; then
-        err "获取服务器公网 IP 失败。"
-        return 1
-    fi
+    # 解析 JSON
+    # 获取第一个端口 (主端口)
+    PORT=$(jq -r '.inbounds[0].server_ports[0]' "$CONFIG_FILE")
+    # 获取密码
+    PASS=$(jq -r '.inbounds[0].users[0].password' "$CONFIG_FILE")
+    # 获取 SNI
+    # 注意：sing-box 配置文件里不一定有 SNI 字段用于服务端验证，但我们生成时是用来做证书的
+    # 这里我们假设用生成时的默认值，或者无法从 config 反推时手动提示
+    # 由于 generate_config 没有把 sni 写入 json 的顶层，而是在 tls 证书里，这里我们不从 json 读 SNI，而是重新获取公网 IP
     
-    # 从 JSON 中读取端口
-    # 修改逻辑：支持端口跳跃格式 (例如 :443,10000-20000)
-    # 1. sed 去掉开头的冒号
-    # 2. cut -d ',' -f 1 取逗号前的部分 (主端口)
-    PORT=$(jq -r '.listen' "$CONFIG_FILE" | sed 's/^://' | cut -d ',' -f 1)
+    IP=$(curl -s https://ip.sb || curl -s http://checkip.amazonaws.com)
+    SNI="www.microsoft.com" # 脚本默认值，如果修改过脚本逻辑这里可能需要调整
     
-    SNI=$(jq -r '.tls.sni' "$CONFIG_FILE")
+    # URL 编码密码
+    PASS_ENC=$(echo "$PASS" | jq -Rr @uri)
     
-    # 读取原始密码(无换行)并进行 URL 编码
-    PASSWORD_RAW=$(cat "$HY2_PASS_FILE")
-    PASSWORD_ENCODED=$(echo "$PASSWORD_RAW" | jq -Rr @uri)
-    
-    URL="hy2://${PASSWORD_ENCODED}@${SERVER_IP}:${PORT}?sni=${SNI}&insecure=1"
+    LINK="hysteria2://${PASS_ENC}@${IP}:${PORT}?sni=${SNI}&insecure=1"
     
     # 检查混淆
-    OBFS_PASS_FILE=$($PRINTF_CMD "$OBFS_PASS_TPL" "$MODE")
-    if [ -f "$OBFS_PASS_FILE" ]; then
-        # 读取原始混淆密码(无换行)并进行 URL 编码
-        OBFS_PASS_RAW=$(cat "$OBFS_PASS_FILE")
-        OBFS_PASS_ENCODED=$(echo "$OBFS_PASS_RAW" | jq -Rr @uri)
-        
-        OBFS_TYPE=$(jq -r '.obfs.type' "$CONFIG_FILE")
-        URL="${URL}&obfs=${OBFS_TYPE}&obfs-password=${OBFS_PASS_ENCODED}"
-        ALIAS="hy2-obfs-${PORT}"
+    OBFS_TYPE=$(jq -r '.inbounds[0].obfs.type // empty' "$CONFIG_FILE")
+    if [ "$OBFS_TYPE" = "salamander" ]; then
+        OBFS_PASS=$(jq -r '.inbounds[0].obfs.password' "$CONFIG_FILE")
+        OBFS_PASS_ENC=$(echo "$OBFS_PASS" | jq -Rr @uri)
+        LINK="${LINK}&obfs=salamander&obfs-password=${OBFS_PASS_ENC}"
+        NAME="sb-hy2-obfs"
     else
-        ALIAS="hy2-no-obfs-${PORT}"
+        NAME="sb-hy2"
     fi
     
-    # 添加别名
-    URL="${URL}#${ALIAS}"
+    LINK="${LINK}#${NAME}"
     
-    $PRINTF_CMD "\n--- Hysteria 2 ($NODE_TYPE_STR) 节点链接 ---\n"
-    $PRINTF_CMD "%s%s%s\n\n" "${GREEN}" "$URL" "${NC}"
-}
-
-# 删除节点 (仅配置)
-# 参数1: $1 (mode)
-delete_node() {
-    MODE=$1
-    if [ "$MODE" = "obfs" ]; then
-        NODE_TYPE_STR="混淆"
-    else
-        NODE_TYPE_STR="无混淆"
+    $PRINTF_CMD "\n--- 节点链接 ($MODE) ---\n"
+    $PRINTF_CMD "%s%s%s\n\n" "${GREEN}" "$LINK" "${NC}"
+    
+    # 检查是否有端口跳跃，如果有，提示用户
+    HOP_RANGE=$(jq -r '.inbounds[0].server_ports[1] // empty' "$CONFIG_FILE")
+    if [ -n "$HOP_RANGE" ]; then
+        info "注意：此节点启用了端口跳跃 (范围: $HOP_RANGE)。"
+        info "请确保您的客户端支持解析链接中的端口范围，或者手动在客户端开启跳跃功能。"
     fi
-    
-    CONFIG_FILE=$($PRINTF_CMD "$CONFIG_TPL" "$MODE")
-    HY2_PASS_FILE=$($PRINTF_CMD "$PASS_TPL" "$MODE")
-    OBFS_PASS_FILE=$($PRINTF_CMD "$OBFS_PASS_TPL" "$MODE")
-    
-    if [ ! -f "$CONFIG_FILE" ]; then
-        err "($NODE_TYPE_STR) 节点配置文件已不存在。"
-        return 1
-    fi
-    
-    info "正在删除 ($NODE_TYPE_STR) 节点配置..."
-    stop_service "$MODE"
-    rm -f "$CONFIG_FILE" "$HY2_PASS_FILE" "$OBFS_PASS_FILE"
-    
-    # 移除服务
-    SERVICE_NAME=$($PRINTF_CMD "$SERVICE_TPL" "$MODE")
-    case $SYSTEM_TYPE in
-        "systemd")
-            systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1
-            rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-            systemctl daemon-reload
-            ;;
-        "openrc")
-            rc-update del "$SERVICE_NAME" default >/dev/null 2>&1
-            rm -f "/etc/init.d/${SERVICE_NAME}"
-            ;;
-        "direct")
-            : # stop_service 已处理 PID
-            ;;
-    esac
-    
-    succ "($NODE_TYPE_STR) 节点配置已删除。二进制文件和证书已保留。"
-    info "您可以运行 '搭建节点' 来重新创建它。"
 }
 
-# 内部服务状态检查 (非交互式)
-# 参数1: $1 (mode)
-check_service_status_internal() {
-    MODE=$1
-    SERVICE_NAME=$($PRINTF_CMD "$SERVICE_TPL" "$MODE")
-    PID_FILE=$($PRINTF_CMD "$PID_TPL" "$MODE")
-    
-    case $SYSTEM_TYPE in
-        "systemd")
-            if systemctl is-active --quiet "$SERVICE_NAME"; then
-                return 0
-            else
-                return 1
-            fi
-            ;;
-        "openrc")
-            if rc-service "$SERVICE_NAME" status | grep -q "started"; then
-                return 0
-            else
-                return 1
-            fi
-            ;;
-        "direct")
-            # 使用 /proc/$PID 检查进程是否存在
-            if [ -f "$PID_FILE" ] && [ -d "/proc/$(cat "$PID_FILE")" ]; then
-                return 0
-            else
-                return 1
-            fi
-            ;;
-    esac
-}
-
-
-# 查看服务状态 (非交互式)
-# 参数1: $1 (mode)
-view_status() {
-    MODE=$1
-    SERVICE_NAME=$($PRINTF_CMD "$SERVICE_TPL" "$MODE")
-    PID_FILE=$($PRINTF_CMD "$PID_TPL" "$MODE")
-
-    if [ ! -f "$BINARY_PATH" ]; then
-        err "Hysteria 2 未安装。"
-        return 1
-    fi
-    
-    info "正在获取 ($SERVICE_NAME) 服务状态..."
-    case $SYSTEM_TYPE in
-        "systemd")
-            if systemctl is-active --quiet "$SERVICE_NAME"; then
-                succ "($SERVICE_NAME) 正在运行 (active)。"
-            else
-                err "($SERVICE_NAME) 已停止 (inactive)。"
-                # 自动显示失败日志
-                info "--- 最近 5 条日志 (用于排错) ---"
-                journalctl -n 5 -u "$SERVICE_NAME" --no-pager
-                info "---------------------------------"
-            fi
-            
-            if systemctl is-enabled --quiet "$SERVICE_NAME"; then
-                info "服务已 (enabled) 开机自启。"
-            else
-                info "服务已 (disabled) 禁止开机自启。"
-            fi
-            ;;
-        "openrc")
-            # rc-service status 本身就是非交互式的
-            rc-service "$SERVICE_NAME" status
-            ;;
-        "direct")
-            # 使用 /proc/$PID 检查进程是否存在
-            if [ -f "$PID_FILE" ] && [ -d "/proc/$(cat "$PID_FILE")" ]; then
-                succ "$SERVICE_NAME (direct) TA 正在运行 (PID: $(cat "$PID_FILE"))"
-            else
-                info "$SERVICE_NAME (direct) 已停止。"
-            fi
-            ;;
-    esac
-}
-
-# 卸载 Hy2
-uninstall_hy2() {
-    info "正在完全卸载 Hysteria 2 (包括所有节点)..."
-    stop_service "no-obfs"
-    stop_service "obfs"
-    
-    # 移除服务
-    case $SYSTEM_TYPE in
-        "systemd")
-            systemctl disable --now hy2-no-obfs >/dev/null 2>&1
-            systemctl disable --now hy2-obfs >/dev/null 2>&1
-            rm -f "/etc/systemd/system/hy2-no-obfs.service"
-            rm -f "/etc/systemd/system/hy2-obfs.service"
-            systemctl daemon-reload
-            ;;
-        "openrc")
-            rc-update del hy2-no-obfs default >/dev/null 2>&1
-            rc-update del hy2-obfs default >/dev/null 2>&1
-            rm -f "/etc/init.d/hy2-no-obfs"
-            rm -f "/etc/init.d/hy2-obfs"
-            ;;
-        "direct")
-            : # stop_service 已处理 PID
-            ;;
-    esac
-    
-    # 移除文件
-    rm -f "$BINARY_PATH"
-    rm -rf "$CONFIG_DIR" # 删除包含所有配置、证书、密码的整个目录
-    rm -f $($PRINTF_CMD "$PID_TPL" "no-obfs")
-    rm -f $($PRINTF_CMD "$PID_TPL" "obfs")
-    
-    succ "Hysteria 2 已完全卸载。"
-    
-    # 删除脚本自身
-    info "正在删除此脚本..."
-    rm -f "$SCRIPT_PATH"
-    exit 0
-}
-
-# --- 子菜单 ---
-
-# 搭建节点子菜单
-build_node_submenu() {
-    while true; do
-        clear
-        $PRINTF_CMD "--- 搭建节点 ---\n"
-        $PRINTF_CMD "----------------------------------------\n"
-        $PRINTF_CMD "%s 1.%s 搭建无混淆版本\n" "${GREEN}" "${NC}"
-        $PRINTF_CMD "%s 2.%s 搭建混淆版本\n" "${GREEN}" "${NC}"
-        $PRINTF_CMD "----------------------------------------\n"
-        $PRINTF_CMD "%s 0.%s 返回主菜单\n" "${GREEN}" "${NC}"
-        
-        read -p "请输入选项 [0-2]: " sub_choice
-        
-        case $sub_choice in
-            1) 
-                install_hy2_logic "no-obfs"
-                $PRINTF_CMD "\n按任意键返回子菜单..."
-                read -r _
-                ;;
-            2) 
-                install_hy2_logic "obfs"
-                $PRINTF_CMD "\n按任意键返回子菜单..."
-                read -r _
-                ;;
-            0) break ;;
-            *) err "无效选项。"; sleep 2 ;;
-        esac
-    done
-}
-
-# 通用管理子菜单
-# 参数1: $1 (action: "view_link" | "delete_node" | "view_status")
-# 参数2: $2 (title: "查看链接" | "删除节点" | "查看状态")
-manage_node_submenu() {
-    ACTION=$1
-    TITLE=$2
-    
-    while true; do
-        clear
-        $PRINTF_CMD "--- %s ---\n" "$TITLE"
-        $PRINTF_CMD "----------------------------------------\n"
-        $PRINTF_CMD "%s 1.%s 管理 (无混淆) 节点\n" "${GREEN}" "${NC}"
-        $PRINTF_CMD "%s 2.%s 管理 (混淆) 节点\n" "${GREEN}" "${NC}"
-        $PRINTF_CMD "----------------------------------------\n"
-        $PRINTF_CMD "%s 0.%s 返回主菜单\n" "${GREEN}" "${NC}"
-        
-        read -p "请选择要管理的节点 [0-2]: " sub_choice
-        
-        case $sub_choice in
-            1) 
-                $ACTION "no-obfs"
-                # “按任意键”的提示已移到这里，
-                # 这样 view_status 就不需要管它了
-                $PRINTF_CMD "\n按任意键返回子菜单..."
-                read -r _
-                ;;
-            2) 
-                $ACTION "obfs"
-                $PRINTF_CMD "\n按任意键返回子菜单..."
-                read -r _
-                ;;
-            0) break ;;
-            *) err "无效选项。"; sleep 2 ;;
-        esac
-    done
-}
-
-
-# --- 主菜单 ---
+# --- 菜单 ---
 main_menu() {
     clear
-    $PRINTF_CMD "Hysteria 2 (hy2) 管理脚本 (环境: %s)\n" "$SYSTEM_TYPE"
-    $PRINTF_CMD "----------------------------------------\n"
-    
-    $PRINTF_CMD "%s 1.%s 搭建节点 \n" "${GREEN}" "${NC}"
-    $PRINTF_CMD "%s 2.%s 查看节点链接 \n" "${GREEN}" "${NC}"
-    $PRINTF_CMD "%s 3.%s 删除节点 \n" "${YELLOW}" "${NC}"
-    $PRINTF_CMD "%s 4.%s 查看 hy2 服务状态 \n" "${GREEN}" "${NC}"
-    $PRINTF_CMD "%s 5.%s 卸载 hy2 (删除所有文件和脚本)\n" "${RED}" "${NC}"
-    $PRINTF_CMD "----------------------------------------\n"
-    $PRINTF_CMD "%s 0.%s 退出脚本\n" "${GREEN}" "${NC}"
-    
-    read -p "请输入选项 [0-5]: " choice
-    
-    case $choice in
-        1) 
-            build_node_submenu 
-            ;;
-        2) 
-            manage_node_submenu "view_link" "查看节点链接"
-            ;;
-        3) 
-            manage_node_submenu "delete_node" "删除节点"
-            ;;
-        4. | 4) 
-            manage_node_submenu "view_status" "查看服务状态"
-            ;;
+    echo "Sing-box Hysteria 2 管理脚本"
+    echo "----------------------------"
+    echo "1. 搭建无混淆节点"
+    echo "2. 搭建混淆节点 (Salamander)"
+    echo "3. 查看链接 (无混淆)"
+    echo "4. 查看链接 (混淆)"
+    echo "5. 删除节点"
+    echo "0. 退出"
+    read -p "选择: " OPT
+    case $OPT in
+        1) install_node "no-obfs"; read -p "按回车继续..." ;;
+        2) install_node "obfs"; read -p "按回车继续..." ;;
+        3) view_link "no-obfs"; read -p "按回车继续..." ;;
+        4) view_link "obfs"; read -p "按回车继续..." ;;
         5) 
-            uninstall_hy2 
-            ;;
-        0) 
-            exit 0 
-            ;;
-        *) 
-            err "无效选项。"
-            sleep 2
-            ;;
+           read -p "删除哪个? (1. no-obfs, 2. obfs): " DOPT
+           [ "$DOPT" = "1" ] && manage_service delete "no-obfs"
+           [ "$DOPT" = "2" ] && manage_service delete "obfs"
+           read -p "按回车继续..."
+           ;;
+        0) exit 0 ;;
+        *) main_menu ;;
     esac
-    
-    # 卸载(5)和退出(0)之外的选项，都会返回这里，重新调用主菜单
-    if [ "$choice" != "5" ] && [ "$choice" != "0" ]; then
-        main_menu
-    fi
+    main_menu
 }
 
-# --- 脚本入口 ---
 check_root
 detect_system
 main_menu
